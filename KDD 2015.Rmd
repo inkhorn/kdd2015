@@ -1,0 +1,223 @@
+---
+title: "KDD 2015 MOOC Analysis"
+output: html_document
+---
+
+**libraries and data loading**
+
+```{r}
+library("RODBC")
+library(lubridate)
+library(dplyr)
+library(ggplot2)
+library(h2o)
+library(ggthemr)
+ggthemr("fresh")
+channel = odbcConnect("mooc", uid="root", case="nochange")
+
+mooc = sqlQuery(channel, "SELECT * FROM final_output;")
+avg_etime = sqlQuery(channel, "SELECT * FROM event_train_avg_etime;")
+```
+
+**time for feature engineering**
+
+```{r}
+mooc$num_components = apply(mooc[,3:15], 1, function (x) sum(x))
+mooc[,54:66+2] = sapply(mooc[,3:15], function (x) x/mooc$num_components)
+names(mooc)[54:66+2] = paste("Pct_", names(mooc)[3:15], sep="")
+
+mooc$num_logged_events = apply(mooc[,16:22], 1, function(x) sum(x))
+mooc$num_distinct_events = apply(mooc[,16:22], 1, function (x) sum(x > 0))
+mooc[,68:74+3] = sapply(mooc[,16:22], function (x) x/mooc$num_logged_events)
+names(mooc)[68:74+3] = paste("Pct_", names(mooc)[16:22], sep="")
+
+for (i in 23:29) {
+  mooc[,i] = parse_date_time(mooc[,i], "%Y-%m-%d %H:%M:%S")
+}
+
+mooc[,75:81+3] = sapply(mooc[,23:29], lubridate::hour)
+mooc[,82:88+3] = sapply(mooc[,23:29], lubridate::day)
+mooc[,89:95+3] = sapply(mooc[,23:29], lubridate::month)
+names(mooc)[75:81+3] = paste("HOUR_", names(mooc)[23:29], sep = "")
+names(mooc)[82:88+3] = paste("DAY_", names(mooc)[23:29], sep = "")
+names(mooc)[89:95+3] = paste("MONTH_", names(mooc)[23:29], sep = "")
+
+mooc = merge(mooc, avg_etime, by.x = "enrollment_id", by.y="enrollment_id", all.x=TRUE)
+mooc$avg_hour = lubridate::hour(mooc$avg_etime)
+mooc$avg_day = lubridate::day(mooc$avg_etime)
+mooc$avg_month = lubridate::month(mooc$avg_etime)
+
+# Next calculate total time spent on each component by taking the max minus the min unix times and dividing by 60/60/24 to get number of days. (already done but it is still in unix time)
+# however, calc the total time spent on the mooc by taking the max of maxes and subtract from that the min of the mins
+
+mooc[,103:109] = sapply(mooc[,44:50], function (x) x/60/60/24)
+names(mooc)[103:109] = paste("DAYS_", names(mooc)[44:50], sep = "")
+
+mooc$days.in.mooc = apply(mooc[,30:43], 1, function (x) (max(x[8:14], na.rm=TRUE) - min(x[1:7], na.rm=TRUE))/60/60/24)
+```
+
+** Now let's start modeling!**
+
+```{r}
+localH2O = h2o.init()
+
+x.names = c("num_courses", "num_components", "num_students", names(mooc)[c(56:77,103:109)], "days.in.mooc", "avg_hour", "avg_day", "avg_month")
+x.names.nopct = sub("Pct_", "", x.names)
+x.names.smaller = setdiff(x.names, c("Pct_course_info", "Pct_p", "Pct_combinedopenended","Pct_course","DAYS_wiki_total_etime_unix"))
+mooc$dropped_out_factor = factor(mooc$dropped_out_numeric, labels = c("stayed","dropped out"))
+mooc.hex = as.h2o(localH2O, mooc[,c("enrollment_id","dropped_out_factor",x.names)])
+mooc.hex.split = h2o.splitFrame(mooc.hex, ratios=.8)
+
+train.rf = h2o.randomForest(x = x.names, y="dropped_out_factor",
+                            training_frame = mooc.hex.split[[1]],
+                            validation_frame = mooc.hex.split[[2]], ntrees = 300, mtries=8, balance_classes = TRUE)
+
+
+ntree = seq(100,500,100)
+balance_class = c(TRUE,FALSE)
+learn_rate = seq(.05,.4,.05)
+
+parameters = list(ntree = c(), balance_class = c(), learn_rate = c(), r2 = c(), min.r2 = c(), max.r2 = c(), acc = c(), min.acc = c(), max.acc = c(), AUC = c(), min.AUC = c(), max.AUC = c())
+n = 1
+
+mooc.hex = as.h2o(localH2O, mooc[,c("enrollment_id","dropped_out_factor",x.names)])
+for (trees in ntree) {
+  for (c in balance_class) {
+    for (rate in learn_rate) {
+      r2.temp = c(NA,NA,NA)
+      acc.temp = c(NA,NA,NA)
+      auc.temp = c(NA,NA,NA)
+      for (i in 1:3) {
+        
+        mooc.hex.split = h2o.splitFrame(mooc.hex, ratios=.8)   
+        train.gbm = h2o.gbm(x = x.names, y = "dropped_out_factor",  training_frame = mooc.hex.split[[1]],
+                            validation_frame = mooc.hex.split[[2]], ntrees = trees, balance_classes = c, learn_rate = rate)
+        r2.temp[i] = train.gbm@model$validation_metrics@metrics$r2
+        acc.temp[i] = train.gbm@model$validation_metrics@metrics$max_criteria_and_metric_scores[4,3]
+        auc.temp[i] = train.gbm@model$validation_metrics@metrics$AUC
+      }
+    parameters$ntree[n] = trees
+    parameters$balance_class[n] = c
+    parameters$learn_rate[n] = rate
+    parameters$r2[n] = mean(r2.temp)
+    parameters$min.r2[n] = min(r2.temp)
+    parameters$max.r2[n] = max(r2.temp)
+    parameters$acc[n] = mean(acc.temp)
+    parameters$min.acc[n] = min(acc.temp)
+    parameters$max.acc[n] = max(acc.temp)
+    parameters$AUC[n] = mean(auc.temp)
+    parameters$min.AUC[n] = min(auc.temp)
+    parameters$max.AUC[n] = max(auc.temp)
+    n = n+1
+    }
+  }
+}
+
+
+parameters.df = data.frame(parameters)
+parameters.df[which.max(parameters.df$AUC),]
+
+train.gbm = h2o.gbm(x = x.names, y = "dropped_out_factor",  training_frame = mooc.hex.split[[1]],
+                            validation_frame = mooc.hex.split[[2]], ntrees = 500, balance_classes = FALSE, learn_rate = .05)
+
+                    train.gbm.smaller = h2o.gbm(x = x.names.smaller, y = "dropped_out_factor",  training_frame = mooc.hex.split[[1]],
+                            validation_frame = mooc.hex.split[[2]], ntrees = 300, balance_classes = TRUE)
+
+perf = h2o.performance(train.gbm, mooc.hex.split[[2]])
+preds = h2o.predict(train.gbm, mooc.hex.split[[2]])
+
+```
+
+**Let's test to see if we can get a better AUC with a smaller variable set**
+```{r}
+varimps = data.frame(h2o.varimp(train.gbm))
+variable.set = list(nvars = c(), AUC = c(), min.AUC = c(), max.AUC = c())
+
+mooc.hex = as.h2o(localH2O, mooc[,c("enrollment_id","dropped_out_factor",x.names)])
+n = 1
+for (i in seq(35,20)) {
+  auc.temp = c(NA,NA,NA)
+  x.names.new = setdiff(x.names, varimps$variable[i:dim(varimps)[1]])
+  for (j in 1:3) {
+        mooc.hex.split = h2o.splitFrame(mooc.hex, ratios=.8)  
+        train.gbm.smaller = h2o.gbm(x = x.names.new, y = "dropped_out_factor",  training_frame = mooc.hex.split[[1]],
+                            validation_frame = mooc.hex.split[[2]], ntrees = 500, balance_classes = FALSE, learn_rate = .05)
+        auc.temp[j] = train.gbm.smaller@model$validation_metrics@metrics$AUC
+        }
+    variable.set$AUC[n] = mean(auc.temp)
+    variable.set$min.AUC[n] = min(auc.temp)
+    variable.set$max.AUC[n] = max(auc.temp)
+    variable.set$nvars[n] = i-1
+    n = n + 1
+}
+
+variable.set.df = data.frame(variable.set)
+```
+
+**Load the test data set and do the same feature engineering**
+
+```{r}
+mooc.test = sqlQuery(channel, "SELECT * FROM final_output_test;")
+
+avg_etime_test = sqlQuery(channel, "SELECT * FROM event_test_avg_etime;")
+mooc.test = merge(mooc.test, avg_etime_test, by="enrollment_id", all.x= TRUE)
+
+mooc.test$avg_hour = lubridate::hour(mooc.test$avg_etime)
+mooc.test$avg_day = lubridate::day(mooc.test$avg_etime)
+mooc.test$avg_month = lubridate::month(mooc.test$avg_etime)
+
+mooc.test$num_components = apply(mooc.test[,3:15-1], 1, function (x) sum(x))
+mooc.test[,59:71] = sapply(mooc.test[,3:15-1], function (x) x/mooc.test$num_components)
+names(mooc.test)[59:71] = paste("Pct_", names(mooc.test)[3:15-1], sep="")
+
+mooc.test$num_logged_events = apply(mooc.test[,16:22-1], 1, function(x) sum(x))
+mooc.test$num_distinct_events = apply(mooc.test[,16:22-1], 1, function (x) sum(x > 0))
+mooc.test[,74:80] = sapply(mooc.test[,16:22-1], function (x) x/mooc.test$num_logged_events)
+names(mooc.test)[74:80] = paste("Pct_", names(mooc.test)[16:22-1], sep="")
+
+for (i in 22:28) {
+  mooc.test[,i] = parse_date_time(mooc.test[,i], "%Y-%m-%d %H:%M:%S")
+}
+
+mooc.test[,81:87] = sapply(mooc.test[,23:29-1], lubridate::hour)
+mooc.test[,88:94] = sapply(mooc.test[,23:29-1], lubridate::day)
+mooc.test[,95:101] = sapply(mooc.test[,23:29-1], lubridate::month)
+names(mooc.test)[81:87] = paste("HOUR_", names(mooc.test)[23:29-1], sep = "")
+names(mooc.test)[88:94] = paste("DAY_", names(mooc.test)[23:29-1], sep = "")
+names(mooc.test)[95:101] = paste("MONTH_", names(mooc.test)[23:29-1], sep = "")
+
+# Next calculate total time spent on each component by taking the max minus the min unix times and dividing by 60/60/24 to get number of days. (already done but it is still in unix time)
+# however, calc the total time spent on the mooc by taking the max of maxes and subtract from that the min of the mins
+
+mooc.test[,102:108] = sapply(mooc.test[,44:50-1], function (x) x/60/60/24)
+names(mooc.test)[102:108] = paste("DAYS_", names(mooc.test)[44:50-1], sep = "")
+
+mooc.test$days.in.mooc = apply(mooc.test[,30:43-1], 1, function (x) (max(x[8:14], na.rm=TRUE) - min(x[1:7], na.rm=TRUE))/60/60/24)
+```
+
+**Now load the testing set into h2o and predict drop-out.**
+
+```{r}
+mooc.test.hex = as.h2o(localH2O, mooc.test[,c("enrollment_id",x.names)])
+mooc.test.hex[,"prob.dropout"] = h2o.predict(train.gbm, mooc.test.hex)[,2]
+
+h2o.exportFile(mooc.test.hex[,c("enrollment_id","prob.dropout")], "/media/altHD/KDD2015/mooc_test_predictions.csv", force = TRUE)
+```
+
+**Some Graphs**
+
+```{r}
+mooc %>% group_by(num_logged_events) %>% summarise(pct.dropped.out = mean(dropped_out_numeric)) %>% ggplot(.) + geom_point(aes(x=num_logged_events, y=pct.dropped.out), stat="identity") + ggtitle("Proportion of MOOC students who dropped out \nby # of logged online interactions with the website.") + geom_smooth(aes(x=num_logged_events, y=pct.dropped.out), colour="dark blue", fill="blue") + scale_x_continuous(limits=c(0,1500))
+
+mooc %>% mutate(days.of.problem.time = cut(DAYS_problem_total_etime_unix, breaks=seq(0,30,6), labels = c("0 - 6", "7 - 12", "13 - 18", "19 - 24", "25 - 30")))  %>% group_by(days.of.problem.time) %>% summarise(pct.dropped.out = mean(dropped_out_numeric)) %>% ggplot(.) + geom_point(aes(x=days.of.problem.time, y=pct.dropped.out), stat="identity", size=5) + ggtitle("Proportion of MOOC students who dropped out \nby # of logged days from first problem entry to last")
+
+mooc %>% mutate(days.in.mooc.intervals = cut(days.in.mooc, breaks=seq(0,30,6), labels = c("0 - 6", "7 - 12", "13 - 18", "19 - 24", "25 - 30")))  %>% group_by(days.in.mooc.intervals) %>% summarise(pct.dropped.out = mean(dropped_out_numeric)) %>% ggplot(.) + geom_point(aes(x=days.in.mooc.intervals, y=pct.dropped.out), stat="identity", size=5) + ggtitle("Proportion of MOOC students who dropped out \nby # of logged days from first to last day of logged events")
+
+mooc %>% group_by(avg_month, avg_day) %>% summarise(pct.dropped.out = mean(dropped_out_numeric)) %>% ggplot(.) + geom_point(aes(x=avg_day, y=pct.dropped.out), stat="identity", alpha=.4, size=4) + ggtitle("Proportion of MOOC students who dropped out \nby average month and day of logged events") + scale_color_discrete() + facet_grid(~avg_month) + geom_smooth(aes(x=avg_day, y=pct.dropped.out),se=FALSE, colour="dark blue")
+
+mooc %>% group_by(num_courses) %>% summarise(pct.dropped.out = mean(dropped_out_numeric)) %>% ggplot(.) + geom_point(aes(x=num_courses, y=pct.dropped.out), stat="identity", alpha=.4, size=4) + ggtitle("Proportion of MOOC students who dropped out \nby number of courses taken per student") + scale_color_discrete() + geom_smooth(aes(x=num_courses, y=pct.dropped.out),se=FALSE, colour="dark blue")
+
+mooc %>% group_by(num_students) %>% summarise(pct.dropped.out = mean(dropped_out_numeric)) %>% ggplot(.) + geom_point(aes(x=num_students, y=pct.dropped.out), stat="identity", alpha=.4, size=4) + ggtitle("Proportion of MOOC students who dropped out \nby number of students per course") + scale_color_discrete() + geom_smooth(aes(x=num_students, y=pct.dropped.out),se=FALSE, colour="dark blue")
+
+ggplot(parameters.df) + geom_line(aes(x=learn_rate, y=AUC, group=ntree, colour=ntree)) + facet_grid(~balance_class) + geom_point(aes(x=learn_rate, y=AUC, colour = ntree),size=3) + scale_color_gradient2() + ggtitle("Model Validation Performance (Area Under Curve) According to Tuning Parameters") + scale_x_continuous(breaks=seq(.05,.4,.05))
+```
