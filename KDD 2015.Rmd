@@ -56,7 +56,7 @@ names(mooc)[103:109] = paste("DAYS_", names(mooc)[44:50], sep = "")
 mooc$days.in.mooc = apply(mooc[,30:43], 1, function (x) (max(x[8:14], na.rm=TRUE) - min(x[1:7], na.rm=TRUE))/60/60/24)
 ```
 
-** Now let's start modeling!**
+**Now let's start modeling!**
 
 ```{r}
 localH2O = h2o.init()
