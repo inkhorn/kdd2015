@@ -54,14 +54,16 @@ mooc[,103:109] = sapply(mooc[,44:50], function (x) x/60/60/24)
 names(mooc)[103:109] = paste("DAYS_", names(mooc)[44:50], sep = "")
 
 mooc$days.in.mooc = apply(mooc[,30:43], 1, function (x) (max(x[8:14], na.rm=TRUE) - min(x[1:7], na.rm=TRUE))/60/60/24)
+
+mooc$events.per.day = mooc$num_logged_events / mooc$days.in.mooc
 ```
 
-**Now let's start modeling!**
+** Now let's start modeling!**
 
 ```{r}
 localH2O = h2o.init()
 
-x.names = c("num_courses", "num_components", "num_students", names(mooc)[c(56:77,103:109)], "days.in.mooc", "avg_hour", "avg_day", "avg_month")
+x.names = c("num_courses", "num_components", "num_students", names(mooc)[c(56:77,103:109)], "days.in.mooc", "avg_hour", "avg_day", "avg_month", "events.per.day")
 x.names.nopct = sub("Pct_", "", x.names)
 x.names.smaller = setdiff(x.names, c("Pct_course_info", "Pct_p", "Pct_combinedopenended","Pct_course","DAYS_wiki_total_etime_unix"))
 mooc$dropped_out_factor = factor(mooc$dropped_out_numeric, labels = c("stayed","dropped out"))
@@ -193,6 +195,8 @@ mooc.test[,102:108] = sapply(mooc.test[,44:50-1], function (x) x/60/60/24)
 names(mooc.test)[102:108] = paste("DAYS_", names(mooc.test)[44:50-1], sep = "")
 
 mooc.test$days.in.mooc = apply(mooc.test[,30:43-1], 1, function (x) (max(x[8:14], na.rm=TRUE) - min(x[1:7], na.rm=TRUE))/60/60/24)
+
+mooc.test$events.per.day = mooc.test$num_logged_events / mooc.test$days.in.mooc
 ```
 
 **Now load the testing set into h2o and predict drop-out.**
@@ -220,4 +224,6 @@ mooc %>% group_by(num_courses) %>% summarise(pct.dropped.out = mean(dropped_out_
 mooc %>% group_by(num_students) %>% summarise(pct.dropped.out = mean(dropped_out_numeric)) %>% ggplot(.) + geom_point(aes(x=num_students, y=pct.dropped.out), stat="identity", alpha=.4, size=4) + ggtitle("Proportion of MOOC students who dropped out \nby number of students per course") + scale_color_discrete() + geom_smooth(aes(x=num_students, y=pct.dropped.out),se=FALSE, colour="dark blue")
 
 ggplot(parameters.df) + geom_line(aes(x=learn_rate, y=AUC, group=ntree, colour=ntree)) + facet_grid(~balance_class) + geom_point(aes(x=learn_rate, y=AUC, colour = ntree),size=3) + scale_color_gradient2() + ggtitle("Model Validation Performance (Area Under Curve) According to Tuning Parameters") + scale_x_continuous(breaks=seq(.05,.4,.05))
+
+ggplot(variable.set.df) + geom_line(aes(x=nvars, y=AUC), stat="identity") +  geom_point(aes(x=nvars, y=AUC), size=3) + scale_x_continuous(breaks=seq(20,34,2), name="# Variables in Model") + geom_point(aes(x=35, y=0.7542866), colour="dark red", size=4) + ggtitle("AUC for the Full Model (in red) \nVersus Models Including Fewer Variables")
 ```
